@@ -36,3 +36,4 @@ using System.Resources;
 [assembly: AssemblyVersion("3.3.3.0")]
 [assembly: AssemblyFileVersion("3.3.3.0")]
 [assembly: NeutralResourcesLanguageAttribute("ru")]
+[assembly: InternalsVisibleTo("xNet.Tests")]
