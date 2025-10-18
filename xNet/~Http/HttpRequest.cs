@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -10,6 +12,8 @@ using System.Security;
 using System.Security.Authentication;
 using System.Text;
 using System.Threading;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace xNet
 {
@@ -171,6 +175,17 @@ namespace xNet
         /// </summary>
         public static readonly Version ProtocolVersion = new Version(1, 1);
 
+        private static readonly ActivitySource _activitySource = new ActivitySource("xNet.HttpRequest");
+        private static readonly Meter _meter = new Meter("xNet.HttpRequest", "1.0.0");
+        private static readonly Histogram<double> _requestDurationHistogram =
+            _meter.CreateHistogram<double>("http.client.request.duration", "ms");
+        private static readonly Counter<long> _bytesSentCounter =
+            _meter.CreateCounter<long>("http.client.request.bytes_sent", "bytes");
+        private static readonly Counter<long> _bytesReceivedCounter =
+            _meter.CreateCounter<long>("http.client.request.bytes_received", "bytes");
+        private static readonly Counter<long> _requestRetryCounter =
+            _meter.CreateCounter<long>("http.client.request.retries");
+
 
         #region Статические поля (закрытые)
 
@@ -236,12 +251,20 @@ namespace xNet
         private int _reconnectLimit = 3;
         private int _reconnectDelay = 100;
         private int _reconnectCount;
+        private bool _reconnectEnabled;
+
+        private readonly ILogger<HttpRequest> _logger;
+        private readonly HttpRequestOptions _options;
+        private Activity _requestActivity;
 
         private HttpMethod _method;
         private HttpContent _content; // Тело запроса.
 
         private readonly Dictionary<string, string> _permanentHeaders =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        private IProgress<long> _uploadProgressReporter;
+        private IProgress<long> _downloadProgressReporter;
 
         // Временные данные, которые задаются через специальные методы.
         // Удаляются после первого запроса.
@@ -312,6 +335,47 @@ namespace xNet
         /// Возвращает URI интернет-ресурса, который фактически отвечает на запрос.
         /// </summary>
         public Uri Address { get; private set; }
+
+        /// <summary>
+        /// Возвращает параметры, используемые для выполнения запросов.
+        /// </summary>
+        public HttpRequestOptions Options
+        {
+            get
+            {
+                return _options;
+            }
+        }
+
+        /// <summary>
+        /// Возвращает или задаёт репортера прогресса отправки данных.
+        /// </summary>
+        public IProgress<long> UploadProgress
+        {
+            get
+            {
+                return _uploadProgressReporter;
+            }
+            set
+            {
+                _uploadProgressReporter = value;
+            }
+        }
+
+        /// <summary>
+        /// Возвращает или задаёт репортера прогресса загрузки данных.
+        /// </summary>
+        public IProgress<long> DownloadProgress
+        {
+            get
+            {
+                return _downloadProgressReporter;
+            }
+            set
+            {
+                _downloadProgressReporter = value;
+            }
+        }
 
         /// <summary>
         /// Возвращает последний ответ от HTTP-сервера, полученный данным экземпляром класса.
@@ -393,6 +457,7 @@ namespace xNet
                 #endregion
 
                 _connectTimeout = value;
+                _options.Timeouts.ConnectTimeout = TimeSpan.FromMilliseconds(value);
             }
         }
 
@@ -419,6 +484,7 @@ namespace xNet
                 #endregion
 
                 _readWriteTimeout = value;
+                _options.Timeouts.ReadWriteTimeout = TimeSpan.FromMilliseconds(value);
             }
         }
 
@@ -460,6 +526,7 @@ namespace xNet
                 #endregion
 
                 _keepAliveTimeout = value;
+                _options.Timeouts.KeepAliveTimeout = TimeSpan.FromMilliseconds(value);
             }
         }
 
@@ -494,7 +561,18 @@ namespace xNet
         /// Возвращает или задает значение, указывающее, нужно ли пробовать переподключаться через n-миллисекунд, если произошла ошибка во время подключения или отправки/загрузки данных.
         /// </summary>
         /// <value>Значение по умолчанию - <see langword="false"/>.</value>
-        public bool Reconnect { get; set; }
+        public bool Reconnect
+        {
+            get
+            {
+                return _reconnectEnabled;
+            }
+            set
+            {
+                _reconnectEnabled = value;
+                _options.Retry.IsEnabled = value;
+            }
+        }
 
         /// <summary>
         /// Возвращает или задает максимальное количество попыток переподключения.
@@ -519,6 +597,7 @@ namespace xNet
                 #endregion
 
                 _reconnectLimit = value;
+                _options.Retry.MaxRetries = value;
             }
         }
 
@@ -545,6 +624,7 @@ namespace xNet
                 #endregion
 
                 _reconnectDelay = value;
+                _options.Retry.BaseDelay = TimeSpan.FromMilliseconds(value);
             }
         }
 
@@ -834,8 +914,18 @@ namespace xNet
         /// Инициализирует новый экземпляр класса <see cref="HttpRequest"/>.
         /// </summary>
         public HttpRequest()
+            : this((Uri)null, null, null)
         {
-            Init();
+        }
+
+        /// <summary>
+        /// Инициализирует новый экземпляр класса <see cref="HttpRequest"/> c параметрами.
+        /// </summary>
+        /// <param name="options">Объект параметров запроса.</param>
+        /// <param name="logger">Логгер, используемый для записи диагностических сообщений.</param>
+        public HttpRequest(HttpRequestOptions options, ILogger<HttpRequest> logger = null)
+            : this((Uri)null, options, logger)
+        {
         }
 
         /// <summary>
@@ -850,36 +940,19 @@ namespace xNet
         /// </exception>
         /// <exception cref="System.ArgumentException">Значение параметра <paramref name="baseAddress"/> не является абсолютным URI.</exception>
         public HttpRequest(string baseAddress)
+            : this(baseAddress, null, null)
         {
-            #region Проверка параметров
+        }
 
-            if (baseAddress == null)
-            {
-                throw new ArgumentNullException("baseAddress");
-            }
-
-            if (baseAddress.Length == 0)
-            {
-                throw ExceptionHelper.EmptyString("baseAddress");
-            }
-
-            #endregion
-
-            if (!baseAddress.StartsWith("http"))
-            {
-                baseAddress = "http://" + baseAddress;
-            }
-
-            var uri = new Uri(baseAddress);
-
-            if (!uri.IsAbsoluteUri)
-            {
-                throw new ArgumentException(Resources.ArgumentException_OnlyAbsoluteUri, "baseAddress");
-            }
-
-            BaseAddress = uri;
-
-            Init();
+        /// <summary>
+        /// Инициализирует новый экземпляр класса <see cref="HttpRequest"/>.
+        /// </summary>
+        /// <param name="baseAddress">Адрес интернет-ресурса.</param>
+        /// <param name="options">Объект параметров запроса.</param>
+        /// <param name="logger">Логгер, используемый для записи диагностических сообщений.</param>
+        public HttpRequest(string baseAddress, HttpRequestOptions options, ILogger<HttpRequest> logger = null)
+            : this(ParseBaseAddress(baseAddress), options, logger)
+        {
         }
 
         /// <summary>
@@ -889,20 +962,25 @@ namespace xNet
         /// <exception cref="System.ArgumentNullException">Значение параметра <paramref name="baseAddress"/> равно <see langword="null"/>.</exception>
         /// <exception cref="System.ArgumentException">Значение параметра <paramref name="baseAddress"/> не является абсолютным URI.</exception>
         public HttpRequest(Uri baseAddress)
+            : this(baseAddress, null, null)
         {
-            #region Проверка параметров
+        }
 
-            if (baseAddress == null)
-            {
-                throw new ArgumentNullException("baseAddress");
-            }
-
-            if (!baseAddress.IsAbsoluteUri)
+        /// <summary>
+        /// Инициализирует новый экземпляр класса <see cref="HttpRequest"/>.
+        /// </summary>
+        /// <param name="baseAddress">Адрес интернет-ресурса.</param>
+        /// <param name="options">Объект параметров запроса.</param>
+        /// <param name="logger">Логгер, используемый для записи диагностических сообщений.</param>
+        public HttpRequest(Uri baseAddress, HttpRequestOptions options, ILogger<HttpRequest> logger = null)
+        {
+            if (baseAddress != null && !baseAddress.IsAbsoluteUri)
             {
                 throw new ArgumentException(Resources.ArgumentException_OnlyAbsoluteUri, "baseAddress");
             }
 
-            #endregion
+            _options = (options ?? HttpRequestOptions.CreateDefault()).Clone();
+            _logger = logger ?? NullLogger<HttpRequest>.Instance;
 
             BaseAddress = baseAddress;
 
@@ -1535,7 +1613,7 @@ namespace xNet
 
             try
             {
-                return Request(method, address, content);
+                return ExecuteWithPipeline(method, address, content);
             }
             finally
             {
@@ -2187,7 +2265,90 @@ namespace xNet
             AllowAutoRedirect = true;
             EnableEncodingContent = true;
 
+            ApplyOptions();
+
             _response = new HttpResponse(this);
+        }
+
+        private void ApplyOptions()
+        {
+            if (_options == null)
+            {
+                return;
+            }
+
+            _connectTimeout = SafeTimeoutValue(_options.Timeouts.ConnectTimeout);
+            _readWriteTimeout = SafeTimeoutValue(_options.Timeouts.ReadWriteTimeout);
+            _keepAliveTimeout = SafeTimeoutValue(_options.Timeouts.KeepAliveTimeout);
+
+            _options.Timeouts.ConnectTimeout = TimeSpan.FromMilliseconds(_connectTimeout);
+            _options.Timeouts.ReadWriteTimeout = TimeSpan.FromMilliseconds(_readWriteTimeout);
+            _options.Timeouts.KeepAliveTimeout = TimeSpan.FromMilliseconds(_keepAliveTimeout);
+
+            _reconnectLimit = Math.Max(1, _options.Retry.MaxRetries);
+            _reconnectDelay = Math.Max(0, SafeTimeoutValue(_options.Retry.BaseDelay));
+            _reconnectEnabled = _options.Retry.IsEnabled;
+
+            _options.Retry.MaxRetries = _reconnectLimit;
+            _options.Retry.BaseDelay = TimeSpan.FromMilliseconds(_reconnectDelay);
+
+            if (_options.DefaultHeaders != null)
+            {
+                foreach (var header in _options.DefaultHeaders)
+                {
+                    if (string.IsNullOrEmpty(header.Key))
+                    {
+                        continue;
+                    }
+
+                    if (!_permanentHeaders.ContainsKey(header.Key))
+                    {
+                        _permanentHeaders[header.Key] = header.Value;
+                    }
+                }
+            }
+        }
+
+        private static int SafeTimeoutValue(TimeSpan timeSpan)
+        {
+            if (timeSpan <= TimeSpan.Zero)
+            {
+                return 0;
+            }
+
+            if (timeSpan.TotalMilliseconds >= int.MaxValue)
+            {
+                return int.MaxValue;
+            }
+
+            return (int)timeSpan.TotalMilliseconds;
+        }
+
+        private static Uri ParseBaseAddress(string baseAddress)
+        {
+            if (baseAddress == null)
+            {
+                throw new ArgumentNullException("baseAddress");
+            }
+
+            if (baseAddress.Length == 0)
+            {
+                throw ExceptionHelper.EmptyString("baseAddress");
+            }
+
+            if (!baseAddress.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            {
+                baseAddress = "http://" + baseAddress;
+            }
+
+            var uri = new Uri(baseAddress);
+
+            if (!uri.IsAbsoluteUri)
+            {
+                throw new ArgumentException(Resources.ArgumentException_OnlyAbsoluteUri, "baseAddress");
+            }
+
+            return uri;
         }
 
         private Uri GetRequestAddress(Uri baseAddress, Uri address)
@@ -2205,6 +2366,205 @@ namespace xNet
             }
 
             return requestAddress;
+        }
+
+        private HttpResponse ExecuteWithPipeline(HttpMethod method, Uri address, HttpContent content)
+        {
+            var safeUri = GetSafeUri(address);
+            var stopwatch = Stopwatch.StartNew();
+
+            using (var activity = _activitySource.StartActivity("HttpRequest.Send", ActivityKind.Client))
+            {
+                if (activity != null)
+                {
+                    activity.SetTag("http.method", method.ToString());
+                    activity.SetTag("http.scheme", address.Scheme);
+                    activity.SetTag("http.host", address.Host);
+                    activity.SetTag("http.path", address.AbsolutePath);
+                }
+
+                _requestActivity = activity;
+
+                _logger.LogInformation("Starting request {Method} {Uri}", method, safeUri);
+
+                try
+                {
+                    var response = Request(method, address, content);
+
+                    stopwatch.Stop();
+                    activity?.SetTag("http.status_code", (int)response.StatusCode);
+                    activity?.SetTag("network.bytes_sent", _totalBytesSent);
+                    activity?.SetTag("network.bytes_received", _totalBytesReceived);
+                    activity?.SetStatus(ActivityStatusCode.Ok);
+
+                    RecordRequestMetrics(method, address, stopwatch.Elapsed, (int)response.StatusCode);
+
+                    _logger.LogInformation(
+                        "Completed request {Method} {Uri} with {StatusCode} in {Elapsed} ms",
+                        method,
+                        safeUri,
+                        (int)response.StatusCode,
+                        stopwatch.Elapsed.TotalMilliseconds);
+
+                    return response;
+                }
+                catch (Exception ex)
+                {
+                    stopwatch.Stop();
+
+                    activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                    activity?.SetTag("error.type", ex.GetType().FullName);
+
+                    RecordRequestMetrics(method, address, stopwatch.Elapsed, null);
+
+                    _logger.LogError(ex,
+                        "Request {Method} {Uri} failed after {Elapsed} ms",
+                        method,
+                        safeUri,
+                        stopwatch.Elapsed.TotalMilliseconds);
+
+                    throw;
+                }
+                finally
+                {
+                    _requestActivity = null;
+                }
+            }
+        }
+
+        private void RecordRequestMetrics(HttpMethod method, Uri address, TimeSpan elapsed, int? statusCode)
+        {
+            var tags = new TagList
+            {
+                { "http.method", method.ToString() },
+                { "http.host", address.Host },
+                { "http.scheme", address.Scheme }
+            };
+
+            if (statusCode.HasValue)
+            {
+                tags.Add("http.status_code", statusCode.Value);
+                tags.Add("outcome", statusCode.Value >= 200 && statusCode.Value < 400 ? "success" : "error");
+            }
+            else
+            {
+                tags.Add("outcome", "error");
+            }
+
+            _requestDurationHistogram.Record(elapsed.TotalMilliseconds, tags);
+
+            if (_totalBytesSent > 0)
+            {
+                _bytesSentCounter.Add(_totalBytesSent, tags);
+            }
+
+            if (_totalBytesReceived > 0)
+            {
+                _bytesReceivedCounter.Add(_totalBytesReceived, tags);
+            }
+        }
+
+        private static string GetSafeUri(Uri address)
+        {
+            if (address == null)
+            {
+                return string.Empty;
+            }
+
+            var builder = new UriBuilder(address)
+            {
+                Query = string.Empty,
+                Fragment = string.Empty,
+                UserName = string.Empty,
+                Password = string.Empty
+            };
+
+            return builder.Uri.GetLeftPart(UriPartial.Path);
+        }
+
+        private void LogConnectionAttempt(Uri address, ProxyClient proxy)
+        {
+            var tags = new ActivityTagsCollection
+            {
+                { "net.peer.name", address.Host },
+                { "net.peer.port", address.Port }
+            };
+
+            if (proxy != null)
+            {
+                tags.Add("proxy.type", proxy.Type.ToString());
+
+                if (!string.IsNullOrEmpty(proxy.Host))
+                {
+                    tags.Add("proxy.host", proxy.Host);
+                }
+            }
+
+            _requestActivity?.AddEvent(new ActivityEvent("Connection.Attempt", tags));
+
+            _logger.LogDebug("Connecting to {Host}:{Port} via {Proxy}",
+                address.Host,
+                address.Port,
+                proxy != null ? proxy.Type.ToString() : "direct");
+        }
+
+        private void LogConnectionEstablished(Uri address)
+        {
+            var tags = new ActivityTagsCollection
+            {
+                { "net.peer.name", address.Host },
+                { "net.peer.port", address.Port }
+            };
+
+            _requestActivity?.AddEvent(new ActivityEvent("Connection.Established", tags));
+
+            _logger.LogDebug("Connection to {Host}:{Port} established",
+                address.Host,
+                address.Port);
+        }
+
+        private void LogConnectionFailure(Uri address, Exception ex)
+        {
+            var tags = new ActivityTagsCollection
+            {
+                { "net.peer.name", address.Host },
+                { "net.peer.port", address.Port },
+                { "error.type", ex.GetType().FullName }
+            };
+
+            _requestActivity?.AddEvent(new ActivityEvent("Connection.Failed", tags));
+
+            _logger.LogWarning(ex, "Connection to {Host}:{Port} failed", address.Host, address.Port);
+        }
+
+        private void LogConnectionReuse(Uri address)
+        {
+            var tags = new ActivityTagsCollection
+            {
+                { "net.peer.name", address.Host },
+                { "net.peer.port", address.Port }
+            };
+
+            _requestActivity?.AddEvent(new ActivityEvent("Connection.Reused", tags));
+
+            _logger.LogDebug("Reusing existing connection to {Host}:{Port}", address.Host, address.Port);
+        }
+
+        private void LogProxyDecision(ProxyClient proxy)
+        {
+            var tags = new ActivityTagsCollection
+            {
+                { "proxy.type", proxy != null ? proxy.Type.ToString() : "none" }
+            };
+
+            if (proxy != null && !string.IsNullOrEmpty(proxy.Host))
+            {
+                tags.Add("proxy.host", proxy.Host);
+            }
+
+            _requestActivity?.AddEvent(new ActivityEvent("Proxy.Selected", tags));
+
+            _logger.LogDebug("Proxy decision: {Proxy}", proxy != null ? proxy.Type.ToString() : "direct");
         }
 
         #region Отправка запроса
@@ -2344,10 +2704,13 @@ namespace xNet
                 _currentProxy = proxy;
 
                 Dispose();
+                LogConnectionAttempt(address, proxy);
                 CreateConnection(address);
+                LogConnectionEstablished(address);
                 return true;
             }
 
+            LogConnectionReuse(address);
             return false;
         }
 
@@ -2419,8 +2782,42 @@ namespace xNet
 
         private HttpResponse ReconnectAfterFail()
         {
+            var safeAddress = Address != null ? GetSafeUri(Address) : string.Empty;
+            var attempt = _reconnectCount + 1;
+
+            var retryTags = new TagList
+            {
+                { "http.method", _method != null ? _method.ToString() : string.Empty }
+            };
+
+            if (Address != null)
+            {
+                retryTags.Add("http.host", Address.Host);
+            }
+
+            _requestRetryCounter.Add(1, retryTags);
+
+            var computedDelay = _options.Retry != null ? _options.Retry.GetDelay(attempt) : TimeSpan.FromMilliseconds(_reconnectDelay);
+            var delayMs = SafeTimeoutValue(computedDelay);
+
+            _requestActivity?.AddEvent(new ActivityEvent("Request.Retry", new ActivityTagsCollection
+            {
+                { "attempt", attempt },
+                { "delay.ms", delayMs }
+            }));
+
+            _logger.LogWarning(
+                "Retrying request {Method} {Uri}. Attempt {Attempt} after {Delay} ms",
+                _method,
+                safeAddress,
+                attempt,
+                delayMs);
+
             Dispose();
-            Thread.Sleep(_reconnectDelay);
+            if (delayMs > 0)
+            {
+                Thread.Sleep(delayMs);
+            }
 
             _reconnectCount++;
             return Request(_method, Address, _content);
@@ -2499,6 +2896,8 @@ namespace xNet
             {
                 proxy = WinInet.IEProxy;
             }
+
+            LogProxyDecision(proxy);
 
             return proxy;
         }
@@ -2596,60 +2995,70 @@ namespace xNet
 
         private void CreateConnection(Uri address)
         {
-            _connection = CreateTcpConnection(address.Host, address.Port);
-            _connectionNetworkStream = _connection.GetStream();
-
-            // Если требуется безопасное соединение.
-            if (address.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+            try
             {
-                try
+                _connection = CreateTcpConnection(address.Host, address.Port);
+                _connectionNetworkStream = _connection.GetStream();
+
+                // Если требуется безопасное соединение.
+                if (address.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
                 {
-                    SslStream sslStream;
-
-                    if (SslCertificateValidatorCallback == null)
+                    try
                     {
-                        sslStream = new SslStream(_connectionNetworkStream, false, Http.AcceptAllCertificationsCallback);
-                    }
-                    else
-                    {
-                        sslStream = new SslStream(_connectionNetworkStream, false, SslCertificateValidatorCallback);
-                    }
+                        SslStream sslStream;
 
-                    sslStream.AuthenticateAsClient(address.Host);
-                    _connectionCommonStream = sslStream;
+                        if (SslCertificateValidatorCallback == null)
+                        {
+                            sslStream = new SslStream(_connectionNetworkStream, false, Http.AcceptAllCertificationsCallback);
+                        }
+                        else
+                        {
+                            sslStream = new SslStream(_connectionNetworkStream, false, SslCertificateValidatorCallback);
+                        }
+
+                        sslStream.AuthenticateAsClient(address.Host);
+                        _connectionCommonStream = sslStream;
+                    }
+                    catch (Exception ex)
+                    {
+                        if (ex is IOException || ex is AuthenticationException)
+                        {
+                            throw NewHttpException(Resources.HttpException_FailedSslConnect, ex, HttpExceptionStatus.ConnectFailure);
+                        }
+
+                        throw;
+                    }
                 }
-                catch (Exception ex)
+                else
                 {
-                    if (ex is IOException || ex is AuthenticationException)
+                    _connectionCommonStream = _connectionNetworkStream;
+                }
+
+                if (_uploadProgressChangedHandler != null ||
+                    _downloadProgressChangedHandler != null ||
+                    _uploadProgressReporter != null ||
+                    _downloadProgressReporter != null)
+                {
+                    var httpWraperStream = new HttpWraperStream(
+                        _connectionCommonStream, _connection.SendBufferSize);
+
+                    if (_uploadProgressChangedHandler != null || _uploadProgressReporter != null)
                     {
-                        throw NewHttpException(Resources.HttpException_FailedSslConnect, ex, HttpExceptionStatus.ConnectFailure);
+                        httpWraperStream.BytesWriteCallback = ReportBytesSent;
                     }
 
-                    throw;
+                    if (_downloadProgressChangedHandler != null || _downloadProgressReporter != null)
+                    {
+                        httpWraperStream.BytesReadCallback = ReportBytesReceived;
+                    }
+
+                    _connectionCommonStream = httpWraperStream;
                 }
             }
-            else
+            catch (Exception ex)
             {
-                _connectionCommonStream = _connectionNetworkStream;
-            }
-
-            if (_uploadProgressChangedHandler != null ||
-                _downloadProgressChangedHandler != null)
-            {
-                var httpWraperStream = new HttpWraperStream(
-                    _connectionCommonStream, _connection.SendBufferSize);
-
-                if (_uploadProgressChangedHandler != null)
-                {
-                    httpWraperStream.BytesWriteCallback = ReportBytesSent;
-                }
-
-                if (_downloadProgressChangedHandler != null)
-                {
-                    httpWraperStream.BytesReadCallback = ReportBytesReceived;
-                }
-
-                _connectionCommonStream = httpWraperStream;
+                LogConnectionFailure(address, ex);
+                throw;
             }
         }
 
@@ -2891,21 +3300,47 @@ namespace xNet
         // Сообщает о том, сколько байт было отправлено HTTP-серверу.
         private void ReportBytesSent(int bytesSent)
         {
+            if (bytesSent <= 0)
+            {
+                return;
+            }
+
             _bytesSent += bytesSent;
 
-            OnUploadProgressChanged(
-                new UploadProgressChangedEventArgs(_bytesSent, _totalBytesSent));
+            if (_uploadProgressReporter != null)
+            {
+                _uploadProgressReporter.Report(_bytesSent);
+            }
+
+            if (_uploadProgressChangedHandler != null)
+            {
+                OnUploadProgressChanged(
+                    new UploadProgressChangedEventArgs(_bytesSent, _totalBytesSent));
+            }
         }
 
         // Сообщает о том, сколько байт было принято от HTTP-сервера.
         private void ReportBytesReceived(int bytesReceived)
         {
+            if (bytesReceived <= 0)
+            {
+                return;
+            }
+
             _bytesReceived += bytesReceived;
 
             if (_canReportBytesReceived)
             {
-                OnDownloadProgressChanged(
-                    new DownloadProgressChangedEventArgs(_bytesReceived, _totalBytesReceived));
+                if (_downloadProgressReporter != null)
+                {
+                    _downloadProgressReporter.Report(_bytesReceived);
+                }
+
+                if (_downloadProgressChangedHandler != null)
+                {
+                    OnDownloadProgressChanged(
+                        new DownloadProgressChangedEventArgs(_bytesReceived, _totalBytesReceived));
+                }
             }
         }
 
