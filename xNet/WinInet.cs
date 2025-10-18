@@ -1,216 +1,122 @@
-﻿using System;
-using System.IO;
-using System.Security;
-using Microsoft.Win32;
+#nullable enable
+using System;
 
 namespace xNet
 {
     /// <summary>
-    /// Представляет класс для взаимодействия с настройками сети операционной системы Windows.
+    /// Provides backward-compatible access to the legacy WinInet API surface.
     /// </summary>
+    [Obsolete("WinInet is deprecated. Use NetworkSettings.Provider instead.")]
     public static class WinInet
     {
-        private const string PathToInternetOptions = @"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-
-
-        #region Статические свойства (открытые)
-
         /// <summary>
-        /// Возвращает значение, указывающие, установлено ли подключение к интернету.
+        /// Gets a value indicating whether an internet connection is available.
         /// </summary>
         public static bool InternetConnected
         {
             get
             {
-                SafeNativeMethods.InternetConnectionState state = 0;
-                return SafeNativeMethods.InternetGetConnectedState(ref state, 0);
+                return NetworkSettings.Provider.InternetConnected;
             }
         }
 
         /// <summary>
-        /// Возвращает значение, указывающие, установлено ли подключение к интернету через модем.
+        /// Gets a value indicating whether the internet connection is established through a modem.
         /// </summary>
         public static bool InternetThroughModem
         {
             get
             {
-                return EqualConnectedState(
-                    SafeNativeMethods.InternetConnectionState.INTERNET_CONNECTION_MODEM);
+                return NetworkSettings.Provider.InternetThroughModem;
             }
         }
 
         /// <summary>
-        /// Возвращает значение, указывающие, установлено ли подключение к интернету через локальную сеть.
+        /// Gets a value indicating whether the internet connection is established through a local network.
         /// </summary>
         public static bool InternetThroughLan
         {
             get
             {
-                return EqualConnectedState(
-                    SafeNativeMethods.InternetConnectionState.INTERNET_CONNECTION_LAN);
+                return NetworkSettings.Provider.InternetThroughLan;
             }
         }
 
         /// <summary>
-        /// Возвращает значение, указывающие, установлено ли подключение к интернету через прокси-сервер.
+        /// Gets a value indicating whether the internet connection is established through a proxy server.
         /// </summary>
         public static bool InternetThroughProxy
         {
             get
             {
-                return EqualConnectedState(
-                    SafeNativeMethods.InternetConnectionState.INTERNET_CONNECTION_PROXY);
+                return NetworkSettings.Provider.InternetThroughProxy;
             }
         }
 
         /// <summary>
-        /// Возвращает значение, указывающее, используется ли прокси-сервер в Internet Explorer.
+        /// Gets or sets a value indicating whether the system proxy is enabled.
         /// </summary>
         public static bool IEProxyEnable
         {
             get
             {
-                try
-                {
-                    return GetIEProxyEnable();
-                }
-                catch (IOException) { return false; }
-                catch (SecurityException) { return false; }
-                catch (ObjectDisposedException) { return false; }
-                catch (UnauthorizedAccessException) { return false; }
+                return NetworkSettings.Provider.ProxyEnabled;
             }
             set
             {
-                try
-                {
-                    SetIEProxyEnable(value);
-                }
-                catch (IOException) { }
-                catch (SecurityException) { }
-                catch (ObjectDisposedException) { }
-                catch (UnauthorizedAccessException) { }
+                NetworkSettings.Provider.ProxyEnabled = value;
             }
         }
 
         /// <summary>
-        /// Возвращает или задаёт прокси-сервер Internet Explorer'а.
+        /// Gets or sets the system proxy represented as a <see cref="HttpProxyClient"/> instance.
         /// </summary>
-        /// <value>Если прокси-сервер Internet Explorer'а не задан или ошибочен, то будет возвращён <see langword="null"/>. Если задать <see langword="null"/>, то прокси-сервер Internet Explorer'а будет стёрт.</value>
-        public static HttpProxyClient IEProxy
+        public static HttpProxyClient? IEProxy
         {
             get
             {
-                string proxy;
-
-                try
-                {
-                    proxy = GetIEProxy();
-                }
-                catch (IOException) { return null; }
-                catch (SecurityException) { return null; }
-                catch (ObjectDisposedException) { return null; }
-                catch (UnauthorizedAccessException) { return null; }
-
-                HttpProxyClient ieProxy;
-                HttpProxyClient.TryParse(proxy, out ieProxy);
-
-                return ieProxy;
+                return NetworkSettings.Provider.IEProxy;
             }
             set
             {
-                try
-                {
-                    if (value != null)
-                    {
-                        SetIEProxy(value.ToString());
-                    }
-                    else
-                    {
-                        SetIEProxy(string.Empty);
-                    }
-                }
-                catch (SecurityException) { }
-                catch (ObjectDisposedException) { }
-                catch (UnauthorizedAccessException) { }
+                NetworkSettings.Provider.IEProxy = value;
             }
         }
 
-        #endregion
-
-
-        #region Статические методы (открытые)
-
         /// <summary>
-        /// Возвращает значение, указывающее, используется ли прокси-сервер в Internet Explorer. Значение берется из реестра.
+        /// Gets a value indicating whether the system proxy is enabled.
         /// </summary>
-        /// <returns>Значение, указывающее, используется ли прокси-сервер в Internet Explorer.</returns>
-        /// <exception cref="System.Security.SecurityException">У пользователя отсутствуют разрешения, необходимые для чтения раздела реестра.</exception>
-        /// <exception cref="System.ObjectDisposedException">Объект <see cref="Microsoft.Win32.RegistryKey"/>, для которого вызывается этот метод, закрыт (доступ к закрытым разделам невозможен).</exception>
-        /// <exception cref="System.UnauthorizedAccessException">У пользователя отсутствуют необходимые права доступа к реестру.</exception>
-        /// <exception cref="System.IO.IOException">Раздел <see cref="Microsoft.Win32.RegistryKey"/>, содержащий заданное значение, был помечен для удаления.</exception>
+        /// <returns><see langword="true"/> if the proxy is enabled; otherwise, <see langword="false"/>.</returns>
         public static bool GetIEProxyEnable()
         {
-            using (RegistryKey regKey = Registry.CurrentUser.OpenSubKey(PathToInternetOptions))
-            {
-                object value = regKey.GetValue("ProxyEnable");
-
-                if (value == null)
-                {
-                    return false;
-                }
-                else
-                {
-                    return ((int)value == 0) ? false : true;
-                }
-            }
+            return NetworkSettings.Provider.ProxyEnabled;
         }
 
         /// <summary>
-        /// Задаёт значение, указывающее, используется ли прокси-сервер в Internet Explorer. Значение задаётся в реестре.
+        /// Sets a value indicating whether the system proxy is enabled.
         /// </summary>
-        /// <param name="enabled">Указывает, используется ли прокси-сервер в Internet Explorer.</param>
-        /// <exception cref="System.Security.SecurityException">У пользователя отсутствуют разрешения, необходимые для создания или открытия раздела реестра.</exception>
-        /// <exception cref="System.ObjectDisposedException">Объект <see cref="Microsoft.Win32.RegistryKey"/>, для которого вызывается этот метод, закрыт (доступ к закрытым разделам невозможен).</exception>
-        /// <exception cref="System.UnauthorizedAccessException">Запись в объект <see cref="Microsoft.Win32.RegistryKey"/> невозможна, например, он не может быть открыт как раздел, доступный для записи, или у пользователя нет необходимых прав доступа.</exception>
+        /// <param name="enabled">The new proxy state.</param>
         public static void SetIEProxyEnable(bool enabled)
         {
-            using (RegistryKey regKey = Registry.CurrentUser.CreateSubKey(PathToInternetOptions))
-            {
-                regKey.SetValue("ProxyEnable", (enabled) ? 1 : 0);
-            }
+            NetworkSettings.Provider.ProxyEnabled = enabled;
         }
 
         /// <summary>
-        /// Возвращает значение прокси-сервера Internet Explorer'а. Значение берется из реестра.
+        /// Gets the raw proxy string stored by the operating system.
         /// </summary>
-        /// <returns>Значение прокси-сервера Internet Explorer'а, иначе пустая строка.</returns>
-        /// <exception cref="System.Security.SecurityException">У пользователя отсутствуют разрешения, необходимые для чтения раздела реестра.</exception>
-        /// <exception cref="System.ObjectDisposedException">Объект <see cref="Microsoft.Win32.RegistryKey"/>, для которого вызывается этот метод, закрыт (доступ к закрытым разделам невозможен).</exception>
-        /// <exception cref="System.UnauthorizedAccessException">У пользователя отсутствуют необходимые права доступа к реестру.</exception>
-        /// <exception cref="System.IO.IOException">Раздел <see cref="Microsoft.Win32.RegistryKey"/>, содержащий заданное значение, был помечен для удаления.</exception>
+        /// <returns>The proxy string or an empty string if the proxy is not configured.</returns>
         public static string GetIEProxy()
         {
-            using (RegistryKey regKey = Registry.CurrentUser.OpenSubKey(PathToInternetOptions))
-            {
-                return (regKey.GetValue("ProxyServer") as string) ?? string.Empty;
-            }
+            return NetworkSettings.Provider.GetProxyString();
         }
 
         /// <summary>
-        /// Задаёт значение прокси-сервера Internet Explorer'а. Значение задаётся в реестре.
+        /// Sets the proxy server using host and port values.
         /// </summary>
-        /// <param name="host">Хост прокси-сервера.</param>
-        /// <param name="port">Порт прокси-сервера.</param>
-        /// <exception cref="System.ArgumentNullException">Значение параметра <paramref name="host"/> равно <see langword="null"/>.</exception>
-        /// <exception cref="System.ArgumentException">Значение параметра <paramref name="host"/> является пустой строкой.</exception>
-        /// <exception cref="System.ArgumentOutOfRangeException">Значение параметра <paramref name="port"/> меньше 1 или больше 65535.</exception>
-        /// <exception cref="System.Security.SecurityException">У пользователя отсутствуют разрешения, необходимые для создания или открытия раздела реестра.</exception>
-        /// <exception cref="System.ObjectDisposedException">Объект <see cref="Microsoft.Win32.RegistryKey"/>, для которого вызывается этот метод, закрыт (доступ к закрытым разделам невозможен).</exception>
-        /// <exception cref="System.UnauthorizedAccessException">Запись в объект <see cref="Microsoft.Win32.RegistryKey"/> невозможна, например, он не может быть открыт как раздел, доступный для записи, или у пользователя нет необходимых прав доступа.</exception>
+        /// <param name="host">The proxy host.</param>
+        /// <param name="port">The proxy port.</param>
         public static void SetIEProxy(string host, int port)
         {
-            #region Проверка параметров
-
             if (host == null)
             {
                 throw new ArgumentNullException("host");
@@ -226,35 +132,16 @@ namespace xNet
                 throw ExceptionHelper.WrongTcpPort("port");
             }
 
-            #endregion
-
-            SetIEProxy(host + ":" + port.ToString());
+            NetworkSettings.Provider.IEProxy = new HttpProxyClient(host, port);
         }
 
         /// <summary>
-        /// Задаёт значение прокси-сервера Internet Explorer'а. Значение задаётся в реестре.
+        /// Sets the proxy server using a raw proxy string.
         /// </summary>
-        /// <param name="hostAndPort">Хост и порт прокси-сервера, в формате - хост:порт, либо только хост.</param>
-        /// <exception cref="System.Security.SecurityException">У пользователя отсутствуют разрешения, необходимые для создания или открытия раздела реестра.</exception>
-        /// <exception cref="System.ObjectDisposedException">Объект <see cref="Microsoft.Win32.RegistryKey"/>, для которого вызывается этот метод, закрыт (доступ к закрытым разделам невозможен).</exception>
-        /// <exception cref="System.UnauthorizedAccessException">Запись в объект <see cref="Microsoft.Win32.RegistryKey"/> невозможна, например, он не может быть открыт как раздел, доступный для записи, или у пользователя нет необходимых прав доступа.</exception>
+        /// <param name="hostAndPort">The proxy string in a WinINet compatible format.</param>
         public static void SetIEProxy(string hostAndPort)
         {
-            using (RegistryKey regKey = Registry.CurrentUser.CreateSubKey(PathToInternetOptions))
-            {
-                regKey.SetValue("ProxyServer", hostAndPort ?? string.Empty);
-            }
-        }
-
-        #endregion
-
-
-        private static bool EqualConnectedState(SafeNativeMethods.InternetConnectionState expected)
-        {
-            SafeNativeMethods.InternetConnectionState state = 0;
-            SafeNativeMethods.InternetGetConnectedState(ref state, 0);
-
-            return (state & expected) != 0;
+            NetworkSettings.Provider.SetProxyString(hostAndPort);
         }
     }
 }
