@@ -2210,6 +2210,7 @@ namespace xNet
 
         #region Методы (защищённые)
 
+        /// <summary>
         /// Освобождает неуправляемые (а при необходимости и управляемые) ресурсы, используемые объектом <see cref="HttpRequest"/>.
         /// </summary>
         /// <param name="disposing">Значение <see langword="true"/> позволяет освободить управляемые и неуправляемые ресурсы; значение <see langword="false"/> позволяет освободить только неуправляемые ресурсы.</param>
@@ -2892,9 +2893,19 @@ namespace xNet
 
             ProxyClient proxy = Proxy ?? GlobalProxy;
 
-            if (proxy == null && UseIeProxy && !WinInet.InternetConnected)
+            if (proxy == null && UseIeProxy)
             {
-                proxy = WinInet.IEProxy;
+                INetworkSettingsProvider networkSettings = NetworkSettings.Provider;
+
+                if (!networkSettings.InternetConnected || networkSettings.ProxyEnabled || networkSettings.InternetThroughProxy)
+                {
+                    var systemProxy = networkSettings.IEProxy;
+
+                    if (systemProxy != null)
+                    {
+                        proxy = systemProxy;
+                    }
+                }
             }
 
             LogProxyDecision(proxy);

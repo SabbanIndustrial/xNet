@@ -1,4 +1,6 @@
-﻿using System;
+#nullable enable
+#if WINDOWS
+using System;
 using System.Runtime.InteropServices;
 using System.Security;
 
@@ -18,9 +20,9 @@ namespace xNet
             INTERNET_CONNECTION_CONFIGURED = 0x40
         }
 
-
         [DllImport("wininet.dll", CharSet = CharSet.Auto, ExactSpelling = true)]
         internal static extern bool InternetGetConnectedState(
             ref InternetConnectionState lpdwFlags, int dwReserved);
     }
 }
+#endif
