@@ -1,6 +1,7 @@
 ﻿using System;
 using System.IO;
 using System.Security;
+using System.Runtime.Versioning;
 using Microsoft.Win32;
 
 namespace xNet
@@ -8,9 +9,11 @@ namespace xNet
     /// <summary>
     /// Представляет класс для взаимодействия с настройками сети операционной системы Windows.
     /// </summary>
+    [SupportedOSPlatform("windows")]
     public static class WinInet
     {
         private const string PathToInternetOptions = @"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+        private static Func<(bool isConnected, SafeNativeMethods.InternetConnectionState state)> _connectionStateProvider = GetConnectionState;
 
 
         #region Статические свойства (открытые)
@@ -22,8 +25,8 @@ namespace xNet
         {
             get
             {
-                SafeNativeMethods.InternetConnectionState state = 0;
-                return SafeNativeMethods.InternetGetConnectedState(ref state, 0);
+                var snapshot = _connectionStateProvider();
+                return snapshot.isConnected;
             }
         }
 
@@ -61,6 +64,17 @@ namespace xNet
                 return EqualConnectedState(
                     SafeNativeMethods.InternetConnectionState.INTERNET_CONNECTION_PROXY);
             }
+        }
+
+        internal static Func<(bool isConnected, SafeNativeMethods.InternetConnectionState state)> ConnectionStateProvider
+        {
+            get => _connectionStateProvider;
+            set => _connectionStateProvider = value ?? throw new ArgumentNullException(nameof(value));
+        }
+
+        internal static void ResetConnectionStateProvider()
+        {
+            _connectionStateProvider = GetConnectionState;
         }
 
         /// <summary>
@@ -251,10 +265,17 @@ namespace xNet
 
         private static bool EqualConnectedState(SafeNativeMethods.InternetConnectionState expected)
         {
-            SafeNativeMethods.InternetConnectionState state = 0;
-            SafeNativeMethods.InternetGetConnectedState(ref state, 0);
+            var snapshot = _connectionStateProvider();
 
-            return (state & expected) != 0;
+            return (snapshot.state & expected) != 0;
+        }
+
+        private static (bool isConnected, SafeNativeMethods.InternetConnectionState state) GetConnectionState()
+        {
+            SafeNativeMethods.InternetConnectionState state = 0;
+            bool connected = SafeNativeMethods.InternetGetConnectedState(ref state, 0);
+
+            return (connected, state);
         }
     }
 }
