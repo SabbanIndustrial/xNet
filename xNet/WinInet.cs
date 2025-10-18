@@ -1,14 +1,23 @@
-#nullable enable
-using System;
+﻿using System;
+using System.IO;
+using System.Security;
+using System.Runtime.Versioning;
+using Microsoft.Win32;
 
 namespace xNet
 {
     /// <summary>
     /// Provides backward-compatible access to the legacy WinInet API surface.
     /// </summary>
-    [Obsolete("WinInet is deprecated. Use NetworkSettings.Provider instead.")]
+    [SupportedOSPlatform("windows")]
     public static class WinInet
     {
+        private const string PathToInternetOptions = @"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+        private static Func<(bool isConnected, SafeNativeMethods.InternetConnectionState state)> _connectionStateProvider = GetConnectionState;
+
+
+        #region Статические свойства (открытые)
+
         /// <summary>
         /// Gets a value indicating whether an internet connection is available.
         /// </summary>
@@ -16,7 +25,8 @@ namespace xNet
         {
             get
             {
-                return NetworkSettings.Provider.InternetConnected;
+                var snapshot = _connectionStateProvider();
+                return snapshot.isConnected;
             }
         }
 
@@ -51,6 +61,17 @@ namespace xNet
             {
                 return NetworkSettings.Provider.InternetThroughProxy;
             }
+        }
+
+        internal static Func<(bool isConnected, SafeNativeMethods.InternetConnectionState state)> ConnectionStateProvider
+        {
+            get => _connectionStateProvider;
+            set => _connectionStateProvider = value ?? throw new ArgumentNullException(nameof(value));
+        }
+
+        internal static void ResetConnectionStateProvider()
+        {
+            _connectionStateProvider = GetConnectionState;
         }
 
         /// <summary>
@@ -141,7 +162,28 @@ namespace xNet
         /// <param name="hostAndPort">The proxy string in a WinINet compatible format.</param>
         public static void SetIEProxy(string hostAndPort)
         {
-            NetworkSettings.Provider.SetProxyString(hostAndPort);
+            using (RegistryKey regKey = Registry.CurrentUser.CreateSubKey(PathToInternetOptions))
+            {
+                regKey.SetValue("ProxyServer", hostAndPort ?? string.Empty);
+            }
+        }
+
+        #endregion
+
+
+        private static bool EqualConnectedState(SafeNativeMethods.InternetConnectionState expected)
+        {
+            var snapshot = _connectionStateProvider();
+
+            return (snapshot.state & expected) != 0;
+        }
+
+        private static (bool isConnected, SafeNativeMethods.InternetConnectionState state) GetConnectionState()
+        {
+            SafeNativeMethods.InternetConnectionState state = 0;
+            bool connected = SafeNativeMethods.InternetGetConnectedState(ref state, 0);
+
+            return (connected, state);
         }
     }
 }

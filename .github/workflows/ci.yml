@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+      XNET_HTTP_PROXY_HOST: 127.0.0.1
+      XNET_HTTP_PROXY_PORT: "8888"
+      XNET_SOCKS4_PROXY_HOST: 127.0.0.1
+      XNET_SOCKS4_PROXY_PORT: "1080"
+      XNET_SOCKS4A_PROXY_HOST: 127.0.0.1
+      XNET_SOCKS4A_PROXY_PORT: "1080"
+      XNET_SOCKS5_PROXY_HOST: 127.0.0.1
+      XNET_SOCKS5_PROXY_PORT: "1080"
+      XNET_PROXY_TARGET_HOST: host.docker.internal
+      XNET_PROXY_TARGET_IPV4: 172.17.0.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: |
+            8.0.x
+            6.0.x
+
+      - name: Start proxy containers
+        run: |
+          docker run -d --name tinyproxy --add-host=host.docker.internal:host-gateway -p 8888:8888 tinyproxy/tinyproxy:1.11.1
+          docker run -d --name dante --add-host=host.docker.internal:host-gateway -p 1080:1080 -v "${{ github.workspace }}/ci/dante.conf":/etc/dante/sockd.conf vimagick/dante
+
+      - name: Restore
+        run: dotnet restore xNet.sln
+
+      - name: Build (Release)
+        run: dotnet build xNet.sln --configuration Release
+
+      - name: Build tests for net6.0
+        run: dotnet build tests/xNet.Tests/xNet.Tests.csproj --framework net6.0 --configuration Release
+
+      - name: Test (net8.0)
+        run: dotnet test tests/xNet.Tests/xNet.Tests.csproj --framework net8.0 --configuration Release --collect:"XPlat Code Coverage"
